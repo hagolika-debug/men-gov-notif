@@ -40,10 +40,26 @@ jobs:
             pip install -r requirements.txt
           fi
 
+      - name: 🇲🇦 Get Morocco Proxy
+        id: proxy
+        run: |
+          # Fetch a free Morocco proxy from a public API
+          # We try to get an HTTPS/HTTP proxy that is currently up
+          PROXY=$(curl -s "https://proxyscrape.com/free-proxy-list/morocco" | grep -m 1 -oP '\d+\.\d+\.\d+\.\d+:\d+')
+          if [ -z "$PROXY" ]; then
+            echo "⚠️ No free Morocco proxy found. Script might fail if geo-blocked."
+          else
+            echo "Using Morocco Proxy: $PROXY"
+            echo "proxy_url=http://$PROXY" >> $GITHUB_OUTPUT
+            # Set environment variables so 'requests' uses it automatically
+            echo "HTTP_PROXY=http://$PROXY" >> $GITHUB_ENV
+            echo "HTTPS_PROXY=http://$PROXY" >> $GITHUB_ENV
+          fi
+
       - name: 🚀 Run Python Script (Background)
         run: |
-          # Start script, capture all output to log file, and run unbuffered (-u)
           touch script_output.log
+          # Using -u for real-time logs
           python3 -u men.gov.py > script_output.log 2>&1 &
           echo "PYTHON_PID=$!" >> $GITHUB_ENV
           echo "Script started with PID: $!"
@@ -53,20 +69,13 @@ jobs:
           RUNTIME_SECS=$((345 * 60))
           END_TIME=$(($(date +%s) + RUNTIME_SECS))
           
-          echo "--- START OF LIVE LOGS ---"
-          # Stream the log file in the background, stops automatically when PID dies
+          echo "--- START OF LIVE LOGS (IP: $(curl -s https://ifconfig.me/ip || echo 'Check failed')) ---"
           tail -n +1 --pid=$PYTHON_PID -f script_output.log &
           
           while [[ $(date +%s) -lt $END_TIME ]]; do
             if ! kill -0 $PYTHON_PID 2>/dev/null; then
               echo "⚠️ Script exited or finished early."
               break
-            fi
-            
-            # Print a status heartbeat every 10 mins without breaking the log stream
-            LEFT=$(( (END_TIME - $(date +%s)) / 60 ))
-            if (( LEFT % 10 == 0 )); then
-               echo "[System Info]: $LEFT minutes remaining until handoff."
             fi
             sleep 60
           done
@@ -75,8 +84,6 @@ jobs:
       - name: 💾 Save State and Restart
         if: always()
         run: |
-          echo "Stopping Python script and saving state..."
-          
           if kill -0 $PYTHON_PID 2>/dev/null; then
             kill $PYTHON_PID
             sleep 5
@@ -87,26 +94,15 @@ jobs:
 
           if [ -f last_announcement_id.txt ]; then
             git add last_announcement_id.txt
-            if ! git diff --staged --quiet; then
-              git commit -m "Update state: last_announcement_id [skip ci]"
-              git push
-            else
-              echo "No changes to last_announcement_id.txt. Skipping push."
-            fi
+            git diff --staged --quiet || (git commit -m "Update state [skip ci]" && git push)
           fi
 
           LOOPS=${{ github.event.inputs.loops }}
-          if [[ "$LOOPS" -eq "1" ]]; then
-            echo "Reached loop limit. Exiting."
-            exit 0
-          fi
-
           NEXT=$(( LOOPS > 1 ? LOOPS - 1 : 0 ))
-
-          echo "Dispatching next run (Loops remaining: $NEXT)..."
-          
-          curl -X POST \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/men-gov.yml/dispatches" \
-            -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"loops\":\"$NEXT\"}}"
+          if [[ "$LOOPS" -ne "1" ]]; then
+            curl -X POST \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/men-gov.yml/dispatches" \
+              -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"loops\":\"$NEXT\"}}"
+          fi
