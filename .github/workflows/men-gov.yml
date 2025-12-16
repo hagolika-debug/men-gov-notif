@@ -8,14 +8,13 @@ on:
         required: false
         default: "0"
 
-# Prevents multiple instances from running and conflicting over the state file
 concurrency:
   group: python-continuous-singleton
   cancel-in-progress: false
 
 permissions:
-  contents: write    # Required to commit/push last_announcement_id.txt
-  actions: write     # Required to trigger the next workflow run
+  contents: write
+  actions: write
 
 jobs:
   run-script:
@@ -26,7 +25,7 @@ jobs:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetches all history so git push works smoothly
+          fetch-depth: 0
 
       - name: 🐍 Set up Python
         uses: actions/setup-python@v5
@@ -43,53 +42,51 @@ jobs:
 
       - name: 🚀 Run Python Script (Background)
         run: |
-          # Start the script in the background and save its process ID
-          python3 men.gov.py &
+          # Start script, capture all output to log file, and run unbuffered (-u)
+          touch script_output.log
+          python3 -u men.gov.py > script_output.log 2>&1 &
           echo "PYTHON_PID=$!" >> $GITHUB_ENV
           echo "Script started with PID: $!"
 
-      - name: ⏳ Execution Loop
+      - name: ⏳ Execution Loop & Real-time Logs
         run: |
-          # Define runtime: 345 minutes (approx 5.75 hours)
-          # This leaves 15 minutes for state saving and handoff
           RUNTIME_SECS=$((345 * 60))
           END_TIME=$(($(date +%s) + RUNTIME_SECS))
           
-          echo "Monitoring men.gov.py for 345 minutes..."
+          echo "--- START OF LIVE LOGS ---"
+          # Stream the log file in the background, stops automatically when PID dies
+          tail -n +1 --pid=$PYTHON_PID -f script_output.log &
           
           while [[ $(date +%s) -lt $END_TIME ]]; do
-            # Check if the process is still running
             if ! kill -0 $PYTHON_PID 2>/dev/null; then
-              echo "⚠️ Script exited or finished early. Stopping loop."
+              echo "⚠️ Script exited or finished early."
               break
             fi
             
+            # Print a status heartbeat every 10 mins without breaking the log stream
             LEFT=$(( (END_TIME - $(date +%s)) / 60 ))
             if (( LEFT % 10 == 0 )); then
-               echo "Session active... ($LEFT min until handoff)"
+               echo "[System Info]: $LEFT minutes remaining until handoff."
             fi
             sleep 60
           done
+          echo "--- END OF LIVE LOGS ---"
 
       - name: 💾 Save State and Restart
         if: always()
         run: |
           echo "Stopping Python script and saving state..."
           
-          # 1. Kill the script if it's still running so it stops writing
           if kill -0 $PYTHON_PID 2>/dev/null; then
             kill $PYTHON_PID
             sleep 5
           fi
 
-          # 2. Configure Git for the automated bot
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
 
-          # 3. Add and Commit the state file
           if [ -f last_announcement_id.txt ]; then
             git add last_announcement_id.txt
-            # Only commit and push if the file actually changed
             if ! git diff --staged --quiet; then
               git commit -m "Update state: last_announcement_id [skip ci]"
               git push
@@ -98,20 +95,13 @@ jobs:
             fi
           fi
 
-          # 4. Handle Recursive Handoff
           LOOPS=${{ github.event.inputs.loops }}
-          
           if [[ "$LOOPS" -eq "1" ]]; then
             echo "Reached loop limit. Exiting."
             exit 0
           fi
 
-          # Calculate next loop count
-          if [[ "$LOOPS" -gt "1" ]]; then
-            NEXT=$((LOOPS - 1))
-          else
-            NEXT=0 # Infinite mode
-          fi
+          NEXT=$(( LOOPS > 1 ? LOOPS - 1 : 0 ))
 
           echo "Dispatching next run (Loops remaining: $NEXT)..."
           
