@@ -42,7 +42,7 @@ jobs:
       - name: 🚀 Run Python Script (Background)
         run: |
           # Start the script in the background and save its process ID
-          python3 dro.py &
+          python3 men.gov.py &
           echo "PYTHON_PID=$!" >> $GITHUB_ENV
           echo "Script started with PID: $!"
 
@@ -53,7 +53,7 @@ jobs:
           RUNTIME_SECS=$((345 * 60))
           END_TIME=$(($(date +%s) + RUNTIME_SECS))
           
-          echo "Monitoring dro.py for 345 minutes..."
+          echo "Monitoring men.gov.py for 345 minutes..."
           
           while [[ $(date +%s) -lt $END_TIME ]]; do
             # Check if the process is still running
