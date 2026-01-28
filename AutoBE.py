@@ -1,3 +1,4 @@
+import json5
 import os as _os
 import zipfile as _zipfile
 import json as _json
@@ -5,29 +6,149 @@ import random as _random
 import shutil as _shutil
 import ctypes as _ctypes
 import tkinter as _tk
-from tkinter import filedialog as _filedialog, messagebox as _messagebox, scrolledtext as _scrolledtext, Menu as _Menu, ttk as _ttk, simpledialog as _simpledialog
+from tkinter import filedialog as _filedialog, messagebox as _messagebox, ttk as _ttk
 import uuid as _uuid
 import hashlib
 import platform
 import datetime as _datetime
 import subprocess
 import re as _re
-import logging as _logging
-import urllib.request as _request
+import logging
+_logging = logging
 import tempfile as _tempfile
 import requests as _requests
 import base64
-import json5
 import sys
 import traceback
-import logging
 import math
 import csv
 import io
 import threading
 from collections import defaultdict
 
+GITHUB_TOKEN = "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"
+GITHUB_REPO = "FrostyHostMC/AutoBE"
+
 logging.basicConfig(filename="error_log.txt", level=logging.ERROR, encoding="utf-8")
+
+def load_json_data(content):
+    """Load JSON content with robust comment stripping and optional JSON5 support."""
+    if not content: return None
+    if isinstance(content, bytes):
+        try: content = content.decode('utf-8')
+        except UnicodeDecodeError: content = content.decode('latin-1', errors='ignore')
+
+    try: return json5.loads(content)
+    except Exception: pass
+
+    # Fallback: manual comment removal
+    content_clean = _re.sub(r'/\*.*?\*/', '', content, flags=_re.DOTALL)
+    lines = content_clean.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        in_string, escape_next, new_line = False, False, []
+        for i, char in enumerate(line):
+            if escape_next: new_line.append(char); escape_next = False
+            elif char == '\\' and in_string: new_line.append(char); escape_next = True
+            elif char == '"': in_string = not in_string; new_line.append(char)
+            elif char == '/' and i + 1 < len(line) and line[i+1] == '/' and not in_string: break
+            else: new_line.append(char)
+        cleaned_lines.append(''.join(new_line))
+    content_clean = '\n'.join(cleaned_lines)
+    content_clean = _re.sub(r',\s*([}\]])', r'\1', content_clean)
+
+    try: return _json.loads(content_clean)
+    except Exception:
+        try:
+            start_idx = content_clean.find('{')
+            if start_idx >= 0:
+                brace_count, in_string, escape_next = 0, False, False
+                for i in range(start_idx, len(content_clean)):
+                    char = content_clean[i]
+                    if escape_next: escape_next = False
+                    elif char == '\\' and in_string: escape_next = True
+                    elif char == '"': in_string = not in_string
+                    elif not in_string:
+                        if char == '{': brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                return _json.loads(content_clean[start_idx:i+1])
+        except Exception: pass
+    return None
+
+def normalize_bedrock_string(s):
+    """Normalize Minecraft Bedrock specific strings for comparison."""
+    if not isinstance(s, str): return s
+    s = _re.sub(r'\s*=\s*', '=', s)
+    replacements = {
+        "1st_person": "first_person", "3rd_person": "third_person",
+        "v.is_first_person": "variable.is_first_person", "q.is_spectator": "query.is_spectator"
+    }
+    for old, new in replacements.items(): s = s.replace(old, new)
+    return s
+
+def deep_merge_json(target, source):
+    """Advanced recursive merge for Minecraft Bedrock JSON files."""
+    if isinstance(source, str): return normalize_bedrock_string(source)
+    if not isinstance(source, (dict, list)): return source
+    if isinstance(source, list):
+        if not isinstance(target, list): return source
+        combined = target + source
+        res, seen = [], set()
+        for item in combined:
+            s = _json.dumps(item, sort_keys=True)
+            if s not in seen: res.append(item); seen.add(s)
+        return res
+    if not isinstance(target, dict): return source
+
+    for k, v in source.items():
+        if k == "format_version" and k in target:
+            try:
+                v1 = [int(x) for x in str(target[k]).split('.')]
+                v2 = [int(x) for x in str(v).split('.')]
+                if v2 > v1: target[k] = v
+            except Exception: pass
+        elif k in ["components", "component_groups", "events"] and isinstance(v, dict):
+            if k not in target: target[k] = {}
+            for sub_k, sub_v in v.items():
+                target[k][sub_k] = deep_merge_json(target[k].get(sub_k), sub_v)
+        elif k == "permutations" and isinstance(v, list):
+            if k not in target: target[k] = []
+            for perm in v:
+                cond = perm.get("condition")
+                found = False
+                for t_perm in target[k]:
+                    if t_perm.get("condition") == cond:
+                        deep_merge_json(t_perm, perm)
+                        found = True; break
+                if not found: target[k].append(perm)
+        elif isinstance(v, dict) and k in target and isinstance(target[k], dict):
+            deep_merge_json(target[k], v)
+        elif isinstance(v, list) and k in target and isinstance(target[k], list):
+            target[k] = deep_merge_json(target[k], v)
+        else:
+            target[k] = v
+    return target
+
+def _generate_hwid_shared():
+    """Shared hardware-based unique identifier generation."""
+    try:
+        if platform.system() == "Windows":
+            cmd = 'powershell -command "(Get-CimInstance Win32_ComputerSystemProduct).UUID"'
+            uuid_v = subprocess.check_output(cmd, shell=True, text=True).strip()
+            if uuid_v and len(uuid_v) > 10: return uuid_v.upper()
+            output = subprocess.check_output("wmic csproduct get uuid", shell=True, text=True).splitlines()
+            for line in output:
+                c = line.strip()
+                if c and "UUID" not in c.upper(): return c.upper()
+        elif platform.system() == "Linux":
+            with open("/etc/machine-id", "r") as f: return f.read().strip()
+        elif platform.system() == "Darwin":
+            c = "system_profiler SPHardwareDataType | grep 'Hardware UUID'"
+            return subprocess.check_output(c, shell=True).decode().split(": ")[1].strip().upper()
+    except Exception: pass
+    return hashlib.md5(platform.node().encode()).hexdigest()
 
 def log_error(e):
     logging.error(str(e), exc_info=True)
@@ -82,15 +203,6 @@ def recursive_extract_pack(archive_path, dest_dir=None, max_depth=10):
         elif _os.path.isdir(file_path) and is_pack_folder(file_path):
             packs_found.append(file_path)
     return packs_found
-
-def folder_to_mcpack(folder, out_mcpack_path):
-    """Zip a folder into a .mcpack file for distribution."""
-    with _zipfile.ZipFile(out_mcpack_path, 'w', _zipfile.ZIP_DEFLATED) as zipf:
-        for root, dirs, files in _os.walk(folder):
-            for file in files:
-                file_path = _os.path.join(root, file)
-                arcname = _os.path.relpath(file_path, folder)
-                zipf.write(file_path, arcname)
 
 class IdentifierManager:
     """
@@ -171,11 +283,8 @@ class IdentifierManager:
         identifiers = set()
         try:
             with pack_zip.open(item_name) as f:
-                content = f.read().decode('utf-8', errors='ignore')
-                # Remove comments
-                content = _re.sub(r'//.*?$|/\*.*?\*/', '', content, flags=_re.MULTILINE | _re.DOTALL)
                 try:
-                    data = _json.loads(content)
+                    data = load_json_data(f.read())
                     # Check for minecraft:entity or minecraft:client_entity
                     for key in ['minecraft:entity', 'minecraft:client_entity']:
                         if key in data:
@@ -194,10 +303,8 @@ class IdentifierManager:
         identifiers = set()
         try:
             with pack_zip.open(item_name) as f:
-                content = f.read().decode('utf-8', errors='ignore')
-                content = _re.sub(r'//.*?$|/\*.*?\*/', '', content, flags=_re.MULTILINE | _re.DOTALL)
                 try:
-                    data = _json.loads(content)
+                    data = load_json_data(f.read())
                     if 'minecraft:item' in data:
                         desc = data['minecraft:item'].get('description', {})
                         item_id = desc.get('identifier')
@@ -214,10 +321,8 @@ class IdentifierManager:
         identifiers = set()
         try:
             with pack_zip.open(item_name) as f:
-                content = f.read().decode('utf-8', errors='ignore')
-                content = _re.sub(r'//.*?$|/\*.*?\*/', '', content, flags=_re.MULTILINE | _re.DOTALL)
                 try:
-                    data = _json.loads(content)
+                    data = load_json_data(f.read())
                     if 'minecraft:block' in data:
                         desc = data['minecraft:block'].get('description', {})
                         block_id = desc.get('identifier')
@@ -249,10 +354,8 @@ class IdentifierManager:
         identifiers = set()
         try:
             with pack_zip.open(item_name) as f:
-                content = f.read().decode('utf-8', errors='ignore')
-                content = _re.sub(r'//.*?$|/\*.*?\*/', '', content, flags=_re.MULTILINE | _re.DOTALL)
                 try:
-                    data = _json.loads(content)
+                    data = load_json_data(f.read())
                     # Recipes can have identifier in description or as key
                     if 'minecraft:recipe_furnace' in data or 'minecraft:recipe_shaped' in data or 'minecraft:recipe_shapeless' in data:
                         for key in data.keys():
@@ -274,10 +377,8 @@ class IdentifierManager:
         identifiers = set()
         try:
             with pack_zip.open(item_name) as f:
-                content = f.read().decode('utf-8', errors='ignore')
-                content = _re.sub(r'//.*?$|/\*.*?\*/', '', content, flags=_re.MULTILINE | _re.DOTALL)
                 try:
-                    data = _json.loads(content)
+                    data = load_json_data(f.read())
                     # Animation controllers are keyed by identifier
                     for key in data.keys():
                         if ':' in key:  # Has namespace:name format
@@ -293,10 +394,8 @@ class IdentifierManager:
         identifiers = set()
         try:
             with pack_zip.open(item_name) as f:
-                content = f.read().decode('utf-8', errors='ignore')
-                content = _re.sub(r'//.*?$|/\*.*?\*/', '', content, flags=_re.MULTILINE | _re.DOTALL)
                 try:
-                    data = _json.loads(content)
+                    data = load_json_data(f.read())
                     # Render controllers are keyed by identifier
                     for key in data.keys():
                         if ':' in key:
@@ -451,12 +550,6 @@ def zip_pack_folder(folder, output_mcpack_path):
                 abs_path = _os.path.join(root, file)
                 arcname = _os.path.join(rel, file) if rel != '.' else file
                 zf.write(abs_path, arcname)
-
-def safe_decode(byte_data):
-    try:
-        return byte_data.decode('utf-8')
-    except UnicodeDecodeError:
-        return byte_data.decode('latin-1')
 
 class _T1:
     def __init__(self, _p1):
@@ -632,116 +725,71 @@ class _ActivationWindow:
 
     def _submit_key(self):
         _key = self._entry_key.get().strip()
-
         if not _key:
             _messagebox.showerror("Error", "Please enter an activation key.")
             return
 
-        _url_keys = "https://raw.githubusercontent.com/FrostyHostMC/AutoBE/main/keys.csv"
-        _headers = {
-            "Authorization": "token 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"
-        }
+        _url_keys = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/keys.csv"
+        _headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
         try:
-            # Fetch the current list of valid keys using requests (handles UTF-8 properly)
             response = _requests.get(_url_keys, headers=_headers, timeout=10)
             response.raise_for_status()
-            response.encoding = 'utf-8'  # Ensure UTF-8 encoding
+            response.encoding = 'utf-8'
             
-            # Parse CSV properly - handles quoted values and escaped quotes ("" becomes ")
             csv_reader = csv.reader(io.StringIO(response.text))
             valid_keys = []
             for row in csv_reader:
                 for key in row:
                     key = key.strip()
-                    if key:
-                        valid_keys.append(key)
+                    if key: valid_keys.append(key)
             
-            # Remove any spaces from input key (in case user accidentally added spaces)
             normalized_input = _key.strip().replace(' ', '')
-
             if normalized_input not in valid_keys:
                 _messagebox.showerror("Error", "Invalid activation key.")
                 return
 
-            # Remove the key from keys.csv (use normalized key)
             valid_keys.remove(normalized_input)
             self._update_keys_csv(valid_keys)
 
             _hwid = self._generate_hwid()
             self._append_hwid(_hwid)
 
-            # Notify the user and close the activation window
             _messagebox.showinfo("Success", "Activation successful! Please Wait About 10 Minutes And Reopen The Tool.")
             self._send_discord_notification(_key)
             self._w1.destroy()
             self._p1.destroy()
-
         except Exception as e:
             log_error(e)
             _messagebox.showerror("Error", f"Failed to validate key. Error: {str(e)}")
 
     def _update_keys_csv(self, valid_keys):
-        """Update the keys.csv file by removing the used key"""
-        _keys_file_url = "https://api.github.com/repos/FrostyHostMC/AutoBE/contents/keys.csv"
-        _headers = {
-            "Authorization": "token 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",
-            "Content-Type": "application/json"
-        }
-        # Recreate the keys.csv content
+        _keys_file_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/keys.csv"
+        _headers = {"Authorization": f"token {GITHUB_TOKEN}", "Content-Type": "application/json"}
         new_content = "\n".join(valid_keys).encode('latin-1')
-        
-        # Base64 encode the content
         encoded_content = base64.b64encode(new_content).decode('latin-1')
-        
         try:
-            # Get the SHA of the current file
             response = _requests.get(_keys_file_url, headers=_headers)
             response.raise_for_status()
             sha = response.json()['sha']
-
-            # Update the file on GitHub with the new content
-            update_data = {
-                "message": "Remove used activation key",
-                "content": encoded_content,
-                "sha": sha
-            }
-            response = _requests.put(_keys_file_url, json=update_data, headers=_headers)
-            response.raise_for_status()
+            update_data = {"message": "Remove used activation key", "content": encoded_content, "sha": sha}
+            _requests.put(_keys_file_url, json=update_data, headers=_headers).raise_for_status()
         except Exception as e:
             log_error(e)
             raise Exception(f"Failed to update keys.csv: {str(e)}")
 
     def _append_hwid(self, _hwid):
-        _hwid_file_url = "https://api.github.com/repos/FrostyHostMC/AutoBE/contents/hwid_address.txt"
-        _headers = {
-            "Authorization": "token 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",
-            "Content-Type": "application/json"
-        }
+        _hwid_file_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/hwid_address.txt"
+        _headers = {"Authorization": f"token {GITHUB_TOKEN}", "Content-Type": "application/json"}
         try:
             response = _requests.get(_hwid_file_url, headers=_headers)
             response.raise_for_status()
-            
             file_data = response.json()
             current_content = base64.b64decode(file_data['content']).decode('utf-8').rstrip()
-            sha = file_data['sha']
-
             updated_content = f"{current_content}\n{_hwid}\n"
             encoded_content = base64.b64encode(updated_content.encode('utf-8')).decode('utf-8')
-            
-            update_data = {
-                "message": "Add new HWID",
-                "content": encoded_content,
-                "sha": sha
-            }
-            put_response = _requests.put(_hwid_file_url, json=update_data, headers=_headers)
-            put_response.raise_for_status()
-            
-            return put_response.json()
-
-        except _requests.exceptions.RequestException as req_err:
-            log_error(req_err)
-            raise Exception(f"HTTP request failed: {str(req_err)}")
+            update_data = {"message": "Add new HWID", "content": encoded_content, "sha": file_data['sha']}
+            _requests.put(_hwid_file_url, json=update_data, headers=_headers).raise_for_status()
         except Exception as e:
             log_error(e)
             raise Exception(f"Failed to update hwid_address.txt: {str(e)}")
@@ -749,51 +797,11 @@ class _ActivationWindow:
     def _send_discord_notification(self, _key):
         _hwid = self._generate_hwid()
         _webhook_url = "https://discord.com/api/webhooks/1279960853969502248/Y7VR7m6qEEe0UScvkZLe1IJO4lK-p7AP8_RAoXsWbsbrBui_geLnA_DW1TFJvvEA-ptg"
-        _data = {
-            "content": f"Activation key used: {_key}\nHWID: {_hwid}"
-        }
+        _data = {"content": f"Activation key used: {_key}\nHWID: {_hwid}"}
         _requests.post(_webhook_url, json=_data)
 
-    def _generate_hwid(self):
-        """Generate a hardware-based unique identifier compatible with the old version."""
-        if platform.system() == "Windows":
-            # Try PowerShell first (Modern, retrieves the exact same UUID as the old WMI library)
-            try:
-                cmd = 'powershell -command "(Get-CimInstance Win32_ComputerSystemProduct).UUID"'
-                uuid_value = subprocess.check_output(cmd, shell=True, text=True).strip()
-                if uuid_value and len(uuid_value) > 10:
-                    return uuid_value.upper()
-            except Exception:
-                pass
+    def _generate_hwid(self): return _generate_hwid_shared()
 
-            # Fallback to WMIC (using a more robust shell call)
-            try:
-                output = subprocess.check_output("wmic csproduct get uuid", shell=True, text=True).splitlines()
-                for line in output:
-                    clean_line = line.strip()
-                    if clean_line and "UUID" not in clean_line.upper():
-                        return clean_line.upper()
-            except Exception:
-                pass
-                
-            # Final fallback if both fail
-            return hashlib.md5(platform.node().encode()).hexdigest()
-            
-        elif platform.system() == "Linux":
-            try:
-                with open("/etc/machine-id", "r") as f:
-                    return f.read().strip()
-            except Exception:
-                return hashlib.md5(platform.node().encode()).hexdigest()
-        elif platform.system() == "Darwin":
-            try:
-                command = "system_profiler SPHardwareDataType | grep 'Hardware UUID'"
-                uuid = subprocess.check_output(command, shell=True).decode().split(": ")[1].strip()
-                return uuid.upper()
-            except Exception:
-                return hashlib.md5(platform.node().encode()).hexdigest()
-        else:
-            return hashlib.md5(platform.node().encode()).hexdigest()
 class _App1:
     def __init__(self, _root):
         self._root = _root
@@ -995,14 +1003,16 @@ class _App1:
         self._root.unbind('<Return>')
         self._root.unbind('<Escape>')
 
+    def _generate_hwid(self): return _generate_hwid_shared()
+
     def _check_activation(self):
         _hwid = self._generate_hwid()
-        _url_hwid_addresses = "https://raw.githubusercontent.com/FrostyHostMC/AutoBE/main/hwid_address.txt"
-        _url_blacklist = "https://raw.githubusercontent.com/FrostyHostMC/AutoBE/main/blacklist.txt"
-        _url_version = "https://raw.githubusercontent.com/FrostyHostMC/AutoBE/main/version.txt"
+        _url_hwid_addresses = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/hwid_address.txt"
+        _url_blacklist = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/blacklist.txt"
+        _url_version = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/version.txt"
 
         _headers = {
-            "Authorization": "token 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"
+            "Authorization": f"token {GITHUB_TOKEN}"
         }
 
         try:
@@ -1052,9 +1062,9 @@ class _App1:
 
             # --- Check HWID whitelist ---
             try:
-                request = _request.Request(_url_hwid_addresses, headers=_headers)
-                with _request.urlopen(request, timeout=10) as response:
-                    valid_hwids = [hwid.strip() for hwid in response.read().decode('utf-8').splitlines()]
+                response = _requests.get(_url_hwid_addresses, headers=_headers, timeout=10)
+                response.raise_for_status()
+                valid_hwids = [hwid.strip() for hwid in response.text.splitlines()]
 
                 if _hwid in valid_hwids:
                     # HWID is valid - unlock application immediately
@@ -1355,9 +1365,9 @@ class _App1:
                 self._activation_error_label.config(text="Please enter an activation key.")
             return
 
-        _url_keys = "https://raw.githubusercontent.com/FrostyHostMC/AutoBE/main/keys.csv"
+        _url_keys = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/keys.csv"
         _headers = {
-            "Authorization": "token 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"
+            "Authorization": f"token {GITHUB_TOKEN}"
         }
 
         try:
@@ -1408,28 +1418,32 @@ class _App1:
             else:
                 _messagebox.showerror("Error", error_msg)
     
+    def _add_btn(self, parent, text, command, bg='#9333ea', fg='#FFFFFF', font=("Segoe UI", 11, "bold"), **kwargs):
+        btn = _tk.Button(parent, text=text, command=command, bg=bg, fg=fg, font=font, relief='flat', cursor='hand2', activebackground='#a855f7', **kwargs)
+        return btn
+
+    def _add_lbl_frame(self, parent, text, font=("Segoe UI", 13, "bold"), bg='#1a1a1a', fg='#FFFFFF', **kwargs):
+        frame = _tk.LabelFrame(parent, text=text, font=font, bg=bg, fg=fg, **kwargs)
+        return frame
+
+    def _add_lbl(self, parent, text, bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 10), **kwargs):
+        lbl = _tk.Label(parent, text=text, bg=bg, fg=fg, font=font, **kwargs)
+        return lbl
+
     def _unlock_application(self):
         """Hide activation overlay and show the main application."""
-        if not self._is_root_alive():
-            return
-        
-        # Hide activation overlay
+        if not self._is_root_alive(): return
         self._activation_overlay.grid_remove()
-        
-        # Show the notebook (main application)
         self.notebook.grid()
-        
-        # Show terms and create widgets
         self._show_terms()
         self._create_widgets()
-        
         _logging.debug('Application unlocked.')
     
     def _update_keys_csv(self, valid_keys):
         """Update the keys.csv file by removing the used key"""
-        _keys_file_url = "https://api.github.com/repos/FrostyHostMC/AutoBE/contents/keys.csv"
+        _keys_file_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/keys.csv"
         _headers = {
-            "Authorization": "token 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",
+            "Authorization": f"token {GITHUB_TOKEN}",
             "Content-Type": "application/json"
         }
         # Recreate the keys.csv content
@@ -1458,9 +1472,9 @@ class _App1:
 
     def _append_hwid(self, _hwid):
         """Append HWID to the whitelist on GitHub"""
-        _hwid_file_url = "https://api.github.com/repos/FrostyHostMC/AutoBE/contents/hwid_address.txt"
+        _hwid_file_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/hwid_address.txt"
         _headers = {
-            "Authorization": "token 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",
+            "Authorization": f"token {GITHUB_TOKEN}",
             "Content-Type": "application/json"
         }
         try:
@@ -1508,76 +1522,59 @@ class _App1:
         self._root.deiconify()
 
     def _create_widgets(self):
-        # Create widgets inside the App1 Tab (app1_frame) - Modern styling
-        # Configure app1_frame for proper resizing
+        # Configure app1_frame
+        for i in range(4): self.app1_frame.grid_rowconfigure(i, weight=1 if i==0 else 0)
         self.app1_frame.grid_columnconfigure(0, weight=1)
-        self.app1_frame.grid_rowconfigure(0, weight=1)  # Files frame - expandable
-        self.app1_frame.grid_rowconfigure(1, weight=0)  # Output frame - fixed
-        self.app1_frame.grid_rowconfigure(2, weight=0)  # Buttons frame - fixed
-        self.app1_frame.grid_rowconfigure(3, weight=0)  # Progress frame - fixed (don't shrink)
-        
-        self._frame_files = _tk.LabelFrame(self.app1_frame, text="📦 Select .mcpack Files", bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 13, "bold"))
+
+        self._frame_files = self._add_lbl_frame(self.app1_frame, "📦 Select .mcpack Files")
         self._frame_files.grid(row=0, column=0, padx=15, pady=15, sticky="nsew")
+        self._file_paths, self._files = {}, []
 
-        # Initialize file mapping: display name -> full path
-        self._file_paths = {}  # Maps display names (filenames) to full file paths
-        self._files = []  # List of full file paths
-
-        # Listbox with scrollbar frame
         listbox_frame = _tk.Frame(self._frame_files, bg='#1a1a1a')
         listbox_frame.grid(row=0, column=0, padx=12, pady=(12, 8), sticky="nsew")
-        listbox_frame.grid_columnconfigure(0, weight=1)
-        listbox_frame.grid_rowconfigure(0, weight=1)
+        listbox_frame.grid_columnconfigure(0, weight=1); listbox_frame.grid_rowconfigure(0, weight=1)
 
         self._file_list = _tk.Listbox(listbox_frame, selectmode=_tk.MULTIPLE, height=12, bg='#0A0A0A', fg='#FFFFFF', font=("Segoe UI", 11), selectbackground='#9333ea', selectforeground='#FFFFFF')
         self._file_list.grid(row=0, column=0, sticky="nsew")
 
         file_scrollbar = _tk.Scrollbar(listbox_frame, orient=_tk.VERTICAL, command=self._file_list.yview, bg='#1a1a1a', troughcolor='#0A0A0A', activebackground='#9333ea')
-        file_scrollbar.grid(row=0, column=1, sticky="ns")
-        self._file_list.config(yscrollcommand=file_scrollbar.set)
+        file_scrollbar.grid(row=0, column=1, sticky="ns"); self._file_list.config(yscrollcommand=file_scrollbar.set)
 
-        # File count label
-        self._file_count_label = _tk.Label(self._frame_files, text="Files selected: 0", bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 10))
+        self._file_count_label = self._add_lbl(self._frame_files, "Files selected: 0")
         self._file_count_label.grid(row=1, column=0, padx=12, pady=(0, 8), sticky="w")
 
-        self._btn_add = _tk.Button(self._frame_files, text="➕ Add Files", command=self._add_files, bg='#9333ea', fg='#FFFFFF', font=("Segoe UI", 11, "bold"), relief='flat', cursor='hand2', activebackground='#a855f7')
+        self._btn_add = self._add_btn(self._frame_files, "➕ Add Files", self._add_files)
         self._btn_add.grid(row=2, column=0, padx=12, pady=(0, 8), sticky="ew")
 
-        self._btn_remove = _tk.Button(self._frame_files, text="🗑️ Remove Selected", command=self._remove_files, bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 11), relief='flat', cursor='hand2', activebackground='#2d2d2d')
+        self._btn_remove = self._add_btn(self._frame_files, "🗑️ Remove Selected", self._remove_files, bg='#1a1a1a', font=("Segoe UI", 11), activebackground='#2d2d2d')
         self._btn_remove.grid(row=3, column=0, padx=12, pady=(0, 12), sticky="ew")
 
-        # Configure resizing for file frame
+        for i in range(4): self._frame_files.grid_rowconfigure(i, weight=1 if i==0 else 0)
         self._frame_files.grid_columnconfigure(0, weight=1)
-        self._frame_files.grid_rowconfigure(0, weight=1)  # Listbox frame - expandable
-        self._frame_files.grid_rowconfigure(1, weight=0)  # File count - fixed
-        self._frame_files.grid_rowconfigure(2, weight=0)  # Add button - fixed
-        self._frame_files.grid_rowconfigure(3, weight=0)  # Remove button - fixed
 
-        self._frame_output = _tk.LabelFrame(self.app1_frame, text="📂 Select Output Directory", bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 13, "bold"))
+        self._frame_output = self._add_lbl_frame(self.app1_frame, "📂 Select Output Directory")
         self._frame_output.grid(row=1, column=0, padx=15, pady=15, sticky="nsew")
+        self._frame_output.grid_columnconfigure(0, weight=1)
 
         self._output_dir_var = _tk.StringVar()
         self._entry_output_dir = _tk.Entry(self._frame_output, textvariable=self._output_dir_var, width=50, bg='#0A0A0A', fg='#FFFFFF', font=("Segoe UI", 11), insertbackground='#a855f7', relief='flat', highlightthickness=1, highlightbackground='#1a1a1a', highlightcolor='#9333ea')
         self._entry_output_dir.grid(row=0, column=0, padx=12, pady=12, sticky="ew", ipady=8)
 
-        self._btn_select_output = _tk.Button(self._frame_output, text="Browse", command=self._select_output_dir, bg='#9333ea', fg='#FFFFFF', font=("Segoe UI", 11, "bold"), relief='flat', cursor='hand2', activebackground='#a855f7')
+        self._btn_select_output = self._add_btn(self._frame_output, "Browse", self._select_output_dir)
         self._btn_select_output.grid(row=0, column=1, padx=(0, 12), pady=12, sticky="ew")
-
-        # Configure resizing for output frame
-        self._frame_output.grid_columnconfigure(0, weight=1)
 
         self._frame_buttons = _tk.Frame(self.app1_frame, bg='#0f1419')
         self._frame_buttons.grid(row=2, column=0, padx=15, pady=15, sticky="ew")
+        for i in range(2): self._frame_buttons.grid_columnconfigure(i, weight=1)
 
-        self._btn_start = _tk.Button(self._frame_buttons, text="🚀 Start Process", command=self._process_and_create_manifest, bg='#9333ea', fg='#FFFFFF', font=("Segoe UI", 12, "bold"), relief='flat', cursor='hand2', activebackground='#a855f7', padx=20, pady=10)
-        self._btn_start.grid(row=0, column=0, padx=(0, 8), pady=0, sticky="ew")
+        self._btn_start = self._add_btn(self._frame_buttons, "🚀 Start Process", self._process_and_create_manifest, font=("Segoe UI", 12, "bold"), padx=20, pady=10)
+        self._btn_start.grid(row=0, column=0, padx=(0, 8), sticky="ew")
 
-        self._btn_check = _tk.Button(self._frame_buttons, text="🔍 Check Packs", command=self._extract_and_show_codes, bg='#9333ea', fg='#FFFFFF', font=("Segoe UI", 12, "bold"), relief='flat', cursor='hand2', activebackground='#a855f7', padx=20, pady=10)
-        self._btn_check.grid(row=0, column=1, padx=(8, 4), pady=0, sticky="ew")
+        self._btn_check = self._add_btn(self._frame_buttons, "🔍 Check Packs", self._extract_and_show_codes, font=("Segoe UI", 12, "bold"), padx=20, pady=10)
+        self._btn_check.grid(row=0, column=1, padx=(8, 4), sticky="ew")
 
-        # Achievement Status Button
-        self._btn_achievement_status = _tk.Button(self._frame_buttons, text="✅ Achievements Active", command=self._show_achievement_info, bg='#10b981', fg='#FFFFFF', font=("Segoe UI", 11, "bold"), relief='flat', cursor='hand2', activebackground='#059669', padx=15, pady=10)
-        self._btn_achievement_status.grid(row=0, column=2, padx=(4, 0), pady=0, sticky="ew")
+        self._btn_achievement_status = self._add_btn(self._frame_buttons, "✅ Achievements Active", self._show_achievement_info, bg='#10b981', activebackground='#059669', padx=15, pady=10)
+        self._btn_achievement_status.grid(row=0, column=2, padx=(4, 0), sticky="ew")
         
         # Store achievement-disabling packs for tooltip
         self._achievement_disabling_packs = []
@@ -1650,104 +1647,49 @@ class _App1:
         self.app1_frame.grid_rowconfigure(4, weight=0)  # Trademark - fixed
 
     def init_mcpacker_tab(self):
-        # Configure mcpacker_frame for proper resizing (will be set after all widgets are created)
-        
-        # Mode Selection Frame - Extract vs Pack (placed first)
-        self._frame_mcpacker_mode = _tk.LabelFrame(self.mcpacker_frame, text="⚙️ Processing Mode", bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 13, "bold"))
+        self._frame_mcpacker_mode = self._add_lbl_frame(self.mcpacker_frame, "⚙️ Processing Mode")
         self._frame_mcpacker_mode.grid(row=0, column=0, padx=15, pady=15, sticky="ew")
         self._frame_mcpacker_mode.grid_columnconfigure(0, weight=1)
         
-        # Mode selection variable
         self.mcpacker_mode_var = _tk.StringVar(value="pack")
-        
-        # Container frame for centering content
         mode_content = _tk.Frame(self._frame_mcpacker_mode, bg='#1a1a1a')
-        mode_content.grid(row=0, column=0, padx=12, pady=12, sticky="")
-        mode_content.grid_columnconfigure(0, weight=1)
+        mode_content.grid(row=0, column=0, padx=12, pady=12)
         
-        # Radio buttons for mode selection
-        self._radio_mcpacker_pack = _tk.Radiobutton(mode_content, 
-                        text="📦 Pack to MCPACK", 
-                        variable=self.mcpacker_mode_var, 
-                        value="pack",
-                        bg='#1a1a1a', fg='#FFFFFF', selectcolor='#9333ea', font=("Segoe UI", 11),
-                        activebackground='#1a1a1a', activeforeground='#FFFFFF',
-                        command=self._update_mcpacker_mode_labels)
+        self._radio_mcpacker_pack = _tk.Radiobutton(mode_content, text="📦 Pack to MCPACK", variable=self.mcpacker_mode_var, value="pack", bg='#1a1a1a', fg='#FFFFFF', selectcolor='#9333ea', font=("Segoe UI", 11), command=self._update_mcpacker_mode_labels)
         self._radio_mcpacker_pack.grid(row=0, column=0, pady=8, sticky="w")
         
-        self._radio_mcpacker_extract = _tk.Radiobutton(mode_content, 
-                        text="📂 Extract to Folders", 
-                        variable=self.mcpacker_mode_var, 
-                        value="extract",
-                        bg='#1a1a1a', fg='#FFFFFF', selectcolor='#9333ea', font=("Segoe UI", 11),
-                        activebackground='#1a1a1a', activeforeground='#FFFFFF',
-                        command=self._update_mcpacker_mode_labels)
+        self._radio_mcpacker_extract = _tk.Radiobutton(mode_content, text="📂 Extract to Folders", variable=self.mcpacker_mode_var, value="extract", bg='#1a1a1a', fg='#FFFFFF', selectcolor='#9333ea', font=("Segoe UI", 11), command=self._update_mcpacker_mode_labels)
         self._radio_mcpacker_extract.grid(row=1, column=0, pady=8, sticky="w")
         
-        # Help text
-        help_text = _tk.Label(mode_content, 
-                            text="Pack: Converts folders to .mcpack files\nExtract: Unzips .mcpack/.mcaddon/.zip to folders",
-                            bg='#1a1a1a', fg='#999999', font=("Segoe UI", 9),
-                            justify='left', anchor='w')
-        help_text.grid(row=2, column=0, pady=(8, 0), sticky="w")
-        
-        # LabelFrame for selecting input files - Modern styling
-        self._frame_mcpacker_files = _tk.LabelFrame(self.mcpacker_frame, text="📦 Select .mcpack/.mcaddon Files", bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 13, "bold"))
-        self._frame_mcpacker_files.grid(row=1, column=0, padx=15, pady=(10, 10), sticky="nsew")
+        self._frame_mcpacker_files = self._add_lbl_frame(self.mcpacker_frame, "📦 Select .mcpack/.mcaddon Files")
+        self._frame_mcpacker_files.grid(row=1, column=0, padx=15, pady=10, sticky="nsew")
+        self._mcpacker_file_paths, self._mcpacker_files = {}, []
 
-        # Initialize file mapping: display name -> full path
-        self._mcpacker_file_paths = {}  # Maps display names (filenames) to full file paths
-        self._mcpacker_files = []  # List of full file paths
+        lb_frame = _tk.Frame(self._frame_mcpacker_files, bg='#1a1a1a')
+        lb_frame.grid(row=0, column=0, padx=12, pady=(8, 6), sticky="nsew")
+        lb_frame.grid_columnconfigure(0, weight=1); lb_frame.grid_rowconfigure(0, weight=1)
 
-        # File List Box - Modern styling with scrollbar
-        listbox_frame = _tk.Frame(self._frame_mcpacker_files, bg='#1a1a1a')
-        listbox_frame.grid(row=0, column=0, padx=12, pady=(8, 6), sticky="nsew")
-        listbox_frame.grid_columnconfigure(0, weight=1)
-        listbox_frame.grid_rowconfigure(0, weight=1)
-
-        self._mcpacker_file_list = _tk.Listbox(listbox_frame, selectmode=_tk.MULTIPLE, height=8, bg='#0A0A0A', fg='#FFFFFF', font=("Segoe UI", 11), selectbackground='#9333ea', selectforeground='#FFFFFF')
+        self._mcpacker_file_list = _tk.Listbox(lb_frame, selectmode=_tk.MULTIPLE, height=8, bg='#0A0A0A', fg='#FFFFFF', font=("Segoe UI", 11), selectbackground='#9333ea', selectforeground='#FFFFFF')
         self._mcpacker_file_list.grid(row=0, column=0, sticky="nsew")
+        _tk.Scrollbar(lb_frame, orient=_tk.VERTICAL, command=self._mcpacker_file_list.yview).grid(row=0, column=1, sticky="ns")
 
-        mcpacker_scrollbar = _tk.Scrollbar(listbox_frame, orient=_tk.VERTICAL, command=self._mcpacker_file_list.yview, bg='#1a1a1a', troughcolor='#0A0A0A', activebackground='#9333ea')
-        mcpacker_scrollbar.grid(row=0, column=1, sticky="ns")
-        self._mcpacker_file_list.config(yscrollcommand=mcpacker_scrollbar.set)
-
-        # File count label
-        self._mcpacker_file_count_label = _tk.Label(self._frame_mcpacker_files, text="Files selected: 0", bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 10))
+        self._mcpacker_file_count_label = self._add_lbl(self._frame_mcpacker_files, "Files selected: 0")
         self._mcpacker_file_count_label.grid(row=1, column=0, padx=12, pady=(0, 6), sticky="w")
 
-        # Button container for better alignment
-        button_container = _tk.Frame(self._frame_mcpacker_files, bg='#1a1a1a')
-        button_container.grid(row=2, column=0, padx=12, pady=(0, 8), sticky="ew")
-        button_container.grid_columnconfigure(0, weight=1)
-        button_container.grid_columnconfigure(1, weight=1)
+        btn_c = _tk.Frame(self._frame_mcpacker_files, bg='#1a1a1a')
+        btn_c.grid(row=2, column=0, padx=12, pady=(0, 8), sticky="ew")
+        btn_c.grid_columnconfigure(0, weight=1); btn_c.grid_columnconfigure(1, weight=1)
         
-        # Browse Button for selecting files - Modern styling
-        self._btn_mcpacker_browse_files = _tk.Button(button_container, text="➕ Add Files", command=self.select_files, bg='#9333ea', fg='#FFFFFF', font=("Segoe UI", 11, "bold"), relief='flat', cursor='hand2', activebackground='#a855f7')
-        self._btn_mcpacker_browse_files.grid(row=0, column=0, padx=(0, 6), sticky="ew")
-        
-        # Remove Selected Button - Modern styling
-        self._btn_mcpacker_remove = _tk.Button(button_container, text="🗑️ Remove Selected", command=self.remove_mcpacker_files, bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 11), relief='flat', cursor='hand2', activebackground='#2d2d2d')
-        self._btn_mcpacker_remove.grid(row=0, column=1, padx=(6, 0), sticky="ew")
+        self._add_btn(btn_c, "➕ Add Files", self.select_files).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        self._add_btn(btn_c, "🗑️ Remove Selected", self.remove_mcpacker_files, bg='#1a1a1a', activebackground='#2d2d2d').grid(row=0, column=1, padx=(6, 0), sticky="ew")
 
-        # Configure resizing for files frame
-        self._frame_mcpacker_files.grid_columnconfigure(0, weight=1)
-        self._frame_mcpacker_files.grid_rowconfigure(0, weight=1)  # Listbox frame - expandable
-        self._frame_mcpacker_files.grid_rowconfigure(1, weight=0)  # File count - fixed
-        self._frame_mcpacker_files.grid_rowconfigure(2, weight=0)  # Buttons - fixed
-
-        # LabelFrame for output directory selection - Modern styling
-        self._frame_mcpacker_output = _tk.LabelFrame(self.mcpacker_frame, text="📂 Select Output Directory", bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 13, "bold"))
-        self._frame_mcpacker_output.grid(row=2, column=0, padx=15, pady=(8, 8), sticky="nsew")
+        self._frame_mcpacker_output = self._add_lbl_frame(self.mcpacker_frame, "📂 Select Output Directory")
+        self._frame_mcpacker_output.grid(row=2, column=0, padx=15, pady=8, sticky="nsew")
+        self._frame_mcpacker_output.grid_columnconfigure(0, weight=1)
 
         self.output_dir_var = _tk.StringVar()
-
-        # Output Directory Entry - Modern styling
-        self._entry_mcpacker_output = _tk.Entry(self._frame_mcpacker_output, textvariable=self.output_dir_var, width=50, bg='#0A0A0A', fg='#FFFFFF', font=("Segoe UI", 11), insertbackground='#a855f7', relief='flat', highlightthickness=1, highlightbackground='#1a1a1a', highlightcolor='#9333ea')
-        self._entry_mcpacker_output.grid(row=0, column=0, padx=12, pady=8, sticky="ew", ipady=6)
-        # Browse Button for selecting output directory - Modern styling
-        self._btn_mcpacker_browse_output = _tk.Button(self._frame_mcpacker_output, text="Browse", command=self.select_output_directory, bg='#9333ea', fg='#FFFFFF', font=("Segoe UI", 11, "bold"), relief='flat', cursor='hand2', activebackground='#a855f7')
-        self._btn_mcpacker_browse_output.grid(row=0, column=1, padx=(0, 12), pady=8, sticky="ew")
+        _tk.Entry(self._frame_mcpacker_output, textvariable=self.output_dir_var, bg='#0A0A0A', fg='#FFFFFF', font=("Segoe UI", 11), relief='flat').grid(row=0, column=0, padx=12, pady=8, sticky="ew", ipady=6)
+        self._add_btn(self._frame_mcpacker_output, "Browse", self.select_output_directory).grid(row=0, column=1, padx=(0, 12), pady=8, sticky="ew")
 
         # Configure resizing for output frame
         self._frame_mcpacker_output.grid_columnconfigure(0, weight=1)
@@ -1829,42 +1771,22 @@ class _App1:
         self.mcpacker_frame.grid_rowconfigure(4, weight=0)  # Controls frame - fixed
 
     def init_list_maker_tab(self):
-        # Frame for List Maker Tab - Modern styling
-        self._frame_list_maker = _tk.LabelFrame(self.list_maker_frame, text="📋 List Maker", bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 13, "bold"))
+        self._frame_list_maker = self._add_lbl_frame(self.list_maker_frame, "📋 List Maker")
         self._frame_list_maker.grid(row=0, column=0, padx=15, pady=15, sticky="nsew")
 
-        # Mode Selection - Modern styling
         self.mode_var = _tk.StringVar(value="merged")
-        self.mode_label = _tk.Label(self._frame_list_maker, text="Mode: Merged Selected", bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 12, "bold"))
+        self.mode_label = self._add_lbl(self._frame_list_maker, "Mode: Merged Selected", font=("Segoe UI", 12, "bold"))
         self.mode_label.grid(row=0, column=0, padx=12, pady=(12, 8), sticky="w")
 
-        self._radio_merged = _tk.Radiobutton(self._frame_list_maker, text="Merged List", variable=self.mode_var, value="merged",
-                        bg='#1a1a1a', fg='#FFFFFF', selectcolor='#9333ea', font=("Segoe UI", 11),
-                        activebackground='#1a1a1a', activeforeground='#FFFFFF', command=self.update_mode_label)
-        self._radio_merged.grid(row=1, column=0, padx=12, pady=5, sticky="w")
-        
-        self._radio_alone = _tk.Radiobutton(self._frame_list_maker, text="Alone List", variable=self.mode_var, value="alone",
-                        bg='#1a1a1a', fg='#FFFFFF', selectcolor='#9333ea', font=("Segoe UI", 11),
-                        activebackground='#1a1a1a', activeforeground='#FFFFFF', command=self.update_mode_label)
-        self._radio_alone.grid(row=2, column=0, padx=12, pady=5, sticky="w")
+        for i, (t, v) in enumerate([("Merged List", "merged"), ("Alone List", "alone")], 1):
+            _tk.Radiobutton(self._frame_list_maker, text=t, variable=self.mode_var, value=v, bg='#1a1a1a', fg='#FFFFFF', selectcolor='#9333ea', font=("Segoe UI", 11), command=self.update_mode_label).grid(row=i, column=0, padx=12, pady=5, sticky="w")
 
-        # Add Files Button - Modern styling
-        self._btn_add_files = _tk.Button(self._frame_list_maker, text="➕ Add MCPack Files", command=self.on_add_files,
-                                         bg='#9333ea', fg='#FFFFFF', font=("Segoe UI", 11, "bold"), relief='flat', cursor='hand2', activebackground='#a855f7')
-        self._btn_add_files.grid(row=3, column=0, padx=12, pady=12, sticky="ew")
-
-        # File List Box - Modern styling
-        self.file_list_box = _tk.Listbox(self._frame_list_maker, width=50, height=10, bg='#0A0A0A', fg='#FFFFFF', font=("Segoe UI", 11), selectbackground='#9333ea', selectforeground='#FFFFFF')
+        self._add_btn(self._frame_list_maker, "➕ Add MCPack Files", self.on_add_files).grid(row=3, column=0, padx=12, pady=12, sticky="ew")
+        self.file_list_box = _tk.Listbox(self._frame_list_maker, height=10, bg='#0A0A0A', fg='#FFFFFF', font=("Segoe UI", 11), selectbackground='#9333ea', selectforeground='#FFFFFF')
         self.file_list_box.grid(row=4, column=0, padx=12, pady=12, sticky="nsew")
+        self._add_btn(self._frame_list_maker, "💾 Export List", self.export_list).grid(row=5, column=0, padx=12, pady=12, sticky="ew")
 
-        # Export List Button - Modern styling
-        self._btn_export_list = _tk.Button(self._frame_list_maker, text="💾 Export List", command=self.export_list,
-                                           bg='#9333ea', fg='#FFFFFF', font=("Segoe UI", 11, "bold"), relief='flat', cursor='hand2', activebackground='#a855f7')
-        self._btn_export_list.grid(row=5, column=0, padx=12, pady=12, sticky="ew")
-
-        # Configure resizing for List Maker frame
-        self._frame_list_maker.grid_columnconfigure(0, weight=1)
-        self._frame_list_maker.grid_rowconfigure(4, weight=1)
+        self._frame_list_maker.grid_columnconfigure(0, weight=1); self._frame_list_maker.grid_rowconfigure(4, weight=1)
 
     def update_mode_label(self):
         selected_mode = self.mode_var.get().capitalize()
@@ -2036,13 +1958,7 @@ class _App1:
         self.current_help_section = _tk.StringVar(value="Getting Started")
         
         for section_name, icon in nav_buttons:
-            btn = _tk.Button(nav_frame, 
-                           text=f"{icon} {section_name}",
-                           command=lambda s=section_name: self._show_help_section(s),
-                           bg='#0A0A0A', fg='#FFFFFF', font=("Segoe UI", 10),
-                           relief='flat', anchor='w', padx=15, pady=12,
-                           cursor='hand2', activebackground='#9333ea', activeforeground='#FFFFFF',
-                           wraplength=230, justify='left')
+            btn = self._add_btn(nav_frame, f"{icon} {section_name}", lambda s=section_name: self._show_help_section(s), bg='#0A0A0A', font=("Segoe UI", 10), anchor='w', padx=15, pady=12, wraplength=230, justify='left')
             btn.pack(fill='x', padx=10, pady=5)
             self.help_sections[section_name] = btn
         
@@ -2545,34 +2461,6 @@ class _App1:
         
         return section_frame
 
-    def check_manifest(self, file_path):
-        """Check if the manifest.json exists in the mcpack/mcaddon file."""
-        with _zipfile.ZipFile(file_path, 'r') as zip_ref:
-            return 'manifest.json' in zip_ref.namelist()
-
-    def sanitize_filename(self, filename):
-        """Sanitize the filename to make it safe for the filesystem."""
-        return _re.sub(r'[^\w\-_\. ]', '_', filename)
-
-    def process_files(self, files, output_dir, save_each_pack_as_mcpack=False):
-        """Process the selected .mcpack and .mcaddon files using recursive extraction, then merge/pack them. Optionally, save each found pack as a .mcpack in the output directory."""
-        packs_to_process = []
-        for input_file in files:
-            ext = _os.path.splitext(input_file)[1].lower()
-            if ext in ('.mcpack', '.mcaddon', '.zip'):
-                packs = recursive_extract_pack(input_file)
-                packs_to_process.extend(packs)
-        # Optionally save each found pack as a .mcpack
-        if save_each_pack_as_mcpack:
-            for pack_folder in packs_to_process:
-                out_name = _os.path.basename(pack_folder.rstrip('/\\')) + ".mcpack"
-                out_path = _os.path.join(output_dir, out_name)
-                folder_to_mcpack(pack_folder, out_path)
-        # Now pass the valid pack folders to the main merge/pack logic
-        if packs_to_process:
-            self._process_packs(packs_to_process, output_dir)
-        else:
-            _messagebox.showerror("Error", "No valid packs found in the selected files.")
 
     def select_files(self):
         """Open file dialog to select .mcpack and .mcaddon files."""
@@ -2618,58 +2506,7 @@ class _App1:
         directory = _filedialog.askdirectory(title="Select Output Directory")
         self.output_dir_var.set(directory)
 
-    def start_process(self):
-        """Start processing the selected files."""
-        files = self.files_var.get().split(',')
-        output_dir = self.output_dir_var.get()
         
-        if not files or not output_dir:
-            _messagebox.showerror("Error", "Please select files and an output directory.")
-            return
-        
-        self.process_files(files, output_dir)
-        _messagebox.showinfo("Success", "Process completed successfully.")
-        
-    def _generate_hwid(self):
-        """Generate a hardware-based unique identifier compatible with the old version."""
-        if platform.system() == "Windows":
-            # Try PowerShell first (Modern, retrieves the exact same UUID as the old WMI library)
-            try:
-                cmd = 'powershell -command "(Get-CimInstance Win32_ComputerSystemProduct).UUID"'
-                uuid_value = subprocess.check_output(cmd, shell=True, text=True).strip()
-                if uuid_value and len(uuid_value) > 10:
-                    return uuid_value.upper()
-            except Exception:
-                pass
-
-            # Fallback to WMIC (using a more robust shell call)
-            try:
-                output = subprocess.check_output("wmic csproduct get uuid", shell=True, text=True).splitlines()
-                for line in output:
-                    clean_line = line.strip()
-                    if clean_line and "UUID" not in clean_line.upper():
-                        return clean_line.upper()
-            except Exception:
-                pass
-                
-            # Final fallback if both fail
-            return hashlib.md5(platform.node().encode()).hexdigest()
-            
-        elif platform.system() == "Linux":
-            try:
-                with open("/etc/machine-id", "r") as f:
-                    return f.read().strip()
-            except Exception:
-                return hashlib.md5(platform.node().encode()).hexdigest()
-        elif platform.system() == "Darwin":
-            try:
-                command = "system_profiler SPHardwareDataType | grep 'Hardware UUID'"
-                uuid = subprocess.check_output(command, shell=True).decode().split(": ")[1].strip()
-                return uuid.upper()
-            except Exception:
-                return hashlib.md5(platform.node().encode()).hexdigest()
-        else:
-            return hashlib.md5(platform.node().encode()).hexdigest()
 
     def _update_progress(self, step, progress_percent, message):
         """Update the progress display with current step and message."""
@@ -3186,85 +3023,31 @@ class _App1:
             _messagebox.showerror("Error", "No valid .mcpack files to process.")
             return
 
-        try:
-            # Process packs
-            self._extract_and_store_highest_versions()
-        except Exception as e:
-            pass
-            
-        try:
-            # Process packs
-            self._process_packs(new_selected_files, _output_dir)
-        except Exception as e:
-            pass
+        # Process packs sequence
+        steps = [
+            (self._extract_and_store_highest_versions, None, None, ""),
+            (self._process_packs, (new_selected_files, _output_dir), None, ""),
+            (self._delete_manifest_files, None, None, ""),
+            (self._create_manifest, None, (1, 5, "Step 1/4: Creating manifest..."), "Step 1/4: Creating manifest... ✓ Complete"),
+            (self._move_tick_and_delete_functions, None, None, ""),
+            (self._process_files, (new_selected_files,), (2, 25, "Step 2/4: Processing files..."), "Step 2/4: Processing files... ✓ Complete"),
+            (self._move_and_cleanup, None, None, ""),
+            (self._update_behavior_pack, None, (3, 50, "Step 3/4: Updating packs..."), "Step 3/4: Updating packs... ✓ Complete"),
+            (self._merge_flipbook_textures, (new_selected_files,), None, ""),
+            (self._merge_textures_list, (new_selected_files,), None, ""),
+            (self._extract_and_delete_zip_files, None, None, ""),
+            (self._move_to_resource_pack, None, (4, 75, "Step 4/4: Finalizing..."), "Step 4/4: Finalizing... ✓ Complete")
+        ]
 
-        try:
-            # Delete manifest files
-            self._delete_manifest_files()
-        except Exception as e:
-            pass
-
-        try:
-            # Step 1/4: Create manifest
-            self._update_progress(1, 5, "Step 1/4: Creating manifest...")
-            self._create_manifest()
-            self._update_progress(1, 25, "Step 1/4: Creating manifest... ✓ Complete")
-        except Exception as e:
-            self._update_progress(1, 25, f"Step 1/4: Error - {str(e)}")
-
-        try:
-            # Move tick and delete functions
-            self._move_tick_and_delete_functions()
-        except Exception as e:
-            pass
-
-        try:
-            # Step 2/4: Process files
-            self._update_progress(2, 25, "Step 2/4: Processing files...")
-            self._process_files(new_selected_files)
-            self._update_progress(2, 50, "Step 2/4: Processing files... ✓ Complete")
-        except Exception as e:
-            self._update_progress(2, 50, f"Step 2/4: Error - {str(e)}")
-
-        try:
-            # Move and cleanup
-            self._move_and_cleanup()
-        except Exception as e:
-            pass
-
-        try:
-            # Step 3/4: Update behavior pack
-            self._update_progress(3, 50, "Step 3/4: Updating packs...")
-            self._update_behavior_pack()
-            self._update_progress(3, 75, "Step 3/4: Updating packs... ✓ Complete")
-        except Exception as e:
-            self._update_progress(3, 75, f"Step 3/4: Error - {str(e)}")
-
-        try:
-            # Merge flipbook textures
-            self._merge_flipbook_textures(new_selected_files)
-        except Exception as e:
-            pass
-
-        try:
-            # Merge textures list
-            self._merge_textures_list(new_selected_files)
-        except Exception as e:
-            pass
-
-        try:
-            # Extract and delete zip files
-            self._extract_and_delete_zip_files()
-        except Exception as e:
-            pass
-
-        try:
-            # Step 4/4: Move to resource pack (final step)
-            self._update_progress(4, 75, "Step 4/4: Finalizing...")
-            self._move_to_resource_pack()
-            self._update_progress(4, 100, "Step 4/4: Finalizing... ✓ Complete")
-        except Exception as e:
-            self._update_progress(4, 100, f"Step 4/4: Error - {str(e)}")
+        for func, args, prog_start, prog_done in steps:
+            try:
+                if prog_start: self._update_progress(*prog_start)
+                if args: func(*args)
+                else: func()
+                if prog_done: self._update_progress(prog_start[0], prog_start[0]*25, prog_done)
+            except Exception as e:
+                log_error(e)
+                if prog_start: self._update_progress(prog_start[0], prog_start[0]*25, f"Step {prog_start[0]}/4: Error - {str(e)}")
 
         # Define paths for behavior and resource packs
         _bp_path = _os.path.join(self._out_dir, "behavior_pack.zip")
@@ -3280,60 +3063,25 @@ class _App1:
         _textures_list_source = _os.path.join(self._out_dir, "textures_list.json")
             
 
-        try:
-            # Move and rename the packs if they exist
-            if _os.path.exists(_bp_path):
-                _shutil.move(_bp_path, _bp_new_path)
-        except Exception as e:
-            log_error(e)
-            _messagebox.showerror("Error", f"Error moving behavior_pack.zip: {str(e)}")
+        # Final cleanup and renaming
+        paths_to_move = [(_bp_path, _bp_new_path), (_rp_path, _rp_new_path)]
+        for src, dst in paths_to_move:
+            try:
+                if _os.path.exists(src): _shutil.move(src, dst)
+            except Exception as e: log_error(e)
 
-        try:
-            if _os.path.exists(_rp_path):
-                _shutil.move(_rp_path, _rp_new_path)
-        except Exception as e:
-            log_error(e)
-            _messagebox.showerror("Error moving resource_pack.zip: {str(e)}")
-
-        try:
-            if _os.path.exists(_scripts_path):
-                _shutil.rmtree(_scripts_path)
-        except Exception as e:
-            pass
-
-        try:
-            if _os.path.exists(_temp_dir):
-                _shutil.rmtree(_temp_dir)
-        except Exception as e:
-            pass
-
-        try:
-            if _os.path.exists(_tempr_dir):
-                _shutil.rmtree(_tempr_dir)
-        except Exception as e:
-            pass
-
-        try:
-            if _os.path.exists(_flipbook_textures_source):
-                _shutil.rmtree(_flipbook_textures_source)
-        except Exception as e:
-            pass
+        cleanup_paths = [_scripts_path, _temp_dir, _tempr_dir, _flipbook_textures_source, _textures_list_source]
+        for p in cleanup_paths:
+            try:
+                if _os.path.exists(p):
+                    if _os.path.isdir(p): _shutil.rmtree(p)
+                    else: _os.remove(p)
+            except Exception: pass
             
-
-        try:
-            if _os.path.exists(_textures_list_source):
-                _shutil.rmtree(_textures_list_source)
-        except Exception as e:
-            pass
-            
-        # Cleanup: Delete the newly modified .mcpack files
         for new_file in new_mcpack_paths:
             try:
-                if _os.path.exists(new_file):
-                    _os.remove(new_file)
-            except Exception as e:
-                log_error(e)
-                _messagebox.showerror("Error", f"Error deleting file {new_file}: {str(e)}")
+                if _os.path.exists(new_file): _os.remove(new_file)
+            except Exception as e: log_error(e)
 
         # Process completed - progress display will show completion
 
@@ -3755,20 +3503,6 @@ class _App1:
         # Wait for user to close
         self._root.wait_variable(overlay_done)
 
-    def _show_version_message(self, sections):
-        # Legacy function - kept for backward compatibility but not used
-        # Prepare the message to display
-        messages = []
-        for section, items in sections.items():
-            if items:
-                messages.append(f"{section}:\n" + "\n".join([f"- {item}" for item in items]))
-
-        if messages:
-            warning_message = "Warning: Merging Addons With Different Codes Or format_version May Cause To Break Some Of The Addons' Features, Also Merging The Json UI And The Scripts May Not Be 100% Perfect."
-            messages.append(warning_message)
-            _messagebox.showinfo("The Addons Used For This Merging", "\n\n".join(messages))
-        else:
-            _messagebox.showinfo("The Addons Used For This Merging", "No valid min_engine_version found.")
 
     def _process_packs(self, _files, _output_dir):
         _output_zip_path_resource = _os.path.join(_output_dir, "resource_pack.zip")
@@ -4148,81 +3882,8 @@ class _App1:
         self._remove_empty_files(_output_zip_path_behavior)
 
     def _merge_json_data(self, target, source):
-        """
-        Recursively merges JSON data from `source` into `target` with intelligent conflict resolution.
-        Handles entity files, player.json, and other common conflict scenarios.
-        """
-        for key, value in source.items():
-            if key in target:
-                # Special handling for entity file properties that should be merged intelligently
-                if key in ['components', 'component_groups', 'events']:
-                    # These should be merged as dictionaries, combining all components/groups/events
-                    # If both addons have the same component/group/event, merge their properties
-                    if isinstance(target[key], dict) and isinstance(value, dict):
-                        # Merge dictionaries recursively to combine all components/groups/events
-                        # This allows: Addon A adds "minecraft:health", Addon B adds "minecraft:movement" -> both kept
-                        # If both modify same component, properties are merged (last one wins for conflicts)
-                        self._merge_json_data(target[key], value)
-                    elif isinstance(target[key], list) and isinstance(value, list):
-                        # If they're lists, combine them
-                        target[key].extend(value)
-                    else:
-                        # If types don't match, try to merge as dicts
-                        if isinstance(value, dict):
-                            if not isinstance(target[key], dict):
-                                target[key] = {}
-                            self._merge_json_data(target[key], value)
-                        elif isinstance(value, list):
-                            if not isinstance(target[key], list):
-                                target[key] = []
-                            target[key].extend(value)
-                        else:
-                            # For primitives, keep the last one (may indicate conflict)
-                            target[key] = value
-                elif key in ['spawn_rules', 'behaviors', 'render_controllers', 'animations', 'animate', 'particle_effects']:
-                    # These should be merged as lists, combining all entries
-                    if isinstance(target[key], list) and isinstance(value, list):
-                        # Combine lists and remove duplicates (preserve order)
-                        combined = target[key] + value
-                        # Remove duplicates while preserving order
-                        seen = set()
-                        unique_list = []
-                        for item in combined:
-                            item_str = str(item) if not isinstance(item, (dict, list)) else _json.dumps(item, sort_keys=True)
-                            if item_str not in seen:
-                                unique_list.append(item)
-                                seen.add(item_str)
-                        target[key] = unique_list
-                    elif isinstance(target[key], dict) and isinstance(value, dict):
-                        # If they're dicts, merge them
-                        self._merge_json_data(target[key], value)
-                    else:
-                        # If types don't match, convert to list if needed
-                        if not isinstance(target[key], list):
-                            target[key] = [target[key]] if target[key] else []
-                        if not isinstance(value, list):
-                            value = [value] if value else []
-                        target[key].extend(value)
-                elif isinstance(target[key], dict) and isinstance(value, dict):
-                    # Recursively merge dictionaries
-                    self._merge_json_data(target[key], value)
-                elif isinstance(target[key], list) and isinstance(value, list):
-                    # Merge lists by extending (components/spawn_rules handled above)
-                    target[key].extend(value)
-                else:
-                    # For primitive values, only overwrite if different and not critical identifiers
-                    # Note: If two addons modify the same primitive property differently, 
-                    # the last one wins. This is intentional but may cause conflicts.
-                    if key not in ['format_version', 'description']:
-                        if str(target[key]) != str(value):
-                            # Log potential conflict for debugging (can be removed in production)
-                            if key in ['max', 'min', 'value', 'amount', 'speed', 'damage']:
-                                # These are common conflict-prone properties
-                                pass  # Could add logging here if needed
-                            target[key] = value
-                    # For format_version and description, keep the first one
-            else:
-                target[key] = value
+        """Advanced recursive merge for Minecraft Bedrock JSON files."""
+        return deep_merge_json(target, source)
 
     def _copy_to_zip(self, _pack_zip, _item, _output_zip, _json_data=None, _pack_path=None, _identifier_manager=None):
         with _pack_zip.open(_item) as _file_data:
@@ -4428,170 +4089,11 @@ class _App1:
             _output_zip.writestr(_os.path.join(_folder_name, _os.path.basename(_item.filename)), _file_data.read())
         
     def _merge_json(self, _json_list, _file_name):
-        def normalize_string(s):
-            try:
-                s = _re.sub(r'\\s*=\\s*', '=', s)
-                s = s.replace("1st_person", "first_person").replace("3rd_person", "third_person")
-                s = s.replace("v.is_first_person", "variable.is_first_person").replace("q.is_spectator", "query.is_spectator")
-                return s
-            except Exception as e:
-                print(f"Error normalizing string '{s}': {e}")
-                return s
-
-        def remove_duplicates_from_list(_list, check_keys=False):
-            unique_list = []
-            seen = set()
-            for item in _list:
-                try:
-                    if isinstance(item, str):
-                        normalized_item = normalize_string(item)
-                        if normalized_item not in seen:
-                            unique_list.append(item)
-                            seen.add(normalized_item)
-                    elif isinstance(item, dict):
-                        normalized_dict = {normalize_string(k): normalize_string(v) if isinstance(v, str) else v for k, v in item.items()}
-                        item_tuple = tuple(sorted(normalized_dict.keys())) if check_keys else tuple(sorted(normalized_dict.items()))
-                        if item_tuple not in seen:
-                            unique_list.append(item)
-                            seen.add(item_tuple)
-                except Exception as e:
-                    print(f"Error processing item '{item}': {e}")
-            return unique_list
-
-        def merge_dicts(merged_dict, new_dict):
-            for k, v in new_dict.items():
-                try:
-                    norm_key = normalize_string(k)
-                    if norm_key in merged_dict:
-                        if isinstance(merged_dict[norm_key], dict) and isinstance(v, dict):
-                            merged_dict[norm_key] = self._merge_json([merged_dict[norm_key], v], _file_name)
-                        elif isinstance(merged_dict[norm_key], list) and isinstance(v, list):
-                            check_keys = _file_name == "player.json" and norm_key in ['render_controllers', 'animations', 'animate', 'particle_effects']
-                            merged_dict[norm_key] = remove_duplicates_from_list(merged_dict[norm_key] + v, check_keys)
-                        else:
-                            if normalize_string(str(v)) != normalize_string(str(merged_dict[norm_key])):
-                                print(f"Duplicate detected and removed: {_file_name}: {k}")
-                    else:
-                        merged_dict[norm_key] = v
-                except Exception as e:
-                    print(f"Error processing key '{k}' with value '{v}': {e}")
-            return merged_dict
-
         _merged = {}
-        _format_version_set = False
-        _format_version = None
-        _warning_shown = False  # Flag to track if the warning has been shown
-
-        # Dictionary to track MCPACK format versions
-        mcpack_versions = {}
-        differing_mcpack_names = set()  # Track MCPACK names with different format versions
-
-        # Use the MCPACK names from _add_files
-        mcpack_names = getattr(self, 'mcpack_names', [])
-
-        # Process each JSON object
-        for index, _json in enumerate(_json_list):
-            try:
-                if 'format_version' in _json:
-                    current_version = _json['format_version']
-                    # Track format_version for each MCPACK
-                    mcpack_name = mcpack_names[index] if index < len(mcpack_names) else 'Unknown MCPACK'
-                    if mcpack_name in mcpack_versions:
-                        if mcpack_versions[mcpack_name] != current_version:
-                            differing_mcpack_names.add(mcpack_name)
-                    mcpack_versions[mcpack_name] = current_version
-                    
-                    if not _format_version_set:
-                        _format_version = current_version
-                        _format_version_set = True
-                    elif current_version != _format_version:
-                        # Update the set of differing MCPACK names
-                        differing_mcpack_names.add(mcpack_name)
-
-                for _key, _value in _json.items():
-                    if _key == "format_version" and not _format_version_set:
-                        _merged[_key] = _value
-                        _format_version_set = True
-                    elif _file_name == "_ui_defs.json":
-                        if _key not in _merged:
-                            _merged[_key] = _value
-                        else:
-                            if isinstance(_value, list):
-                                if not isinstance(_merged[_key], list):
-                                    _merged[_key] = [_merged[_key]]
-                                _merged[_key].extend(_value)
-                                _merged[_key] = remove_duplicates_from_list(_merged[_key])
-                            elif isinstance(_value, str):
-                                if isinstance(_merged[_key], list):
-                                    normalized_value = normalize_string(_value)
-                                    existing_values = [normalize_string(i) for i in _merged[_key]]
-                                    if normalized_value not in existing_values:
-                                        _merged[_key].append(_value)
-                                else:
-                                    _merged[_key] = [_merged[_key], _value]
-                            else:
-                                _merged[_key] = _value
-                    elif _file_name == "player.json":
-                        if _key not in _merged:
-                            _merged[_key] = _value
-                        else:
-                            if isinstance(_value, list):
-                                check_keys = _key in ['render_controllers', 'animations', 'animate', 'particle_effects']
-                                merged_list = _merged[_key] + _value
-                                _merged[_key] = remove_duplicates_from_list(merged_list, check_keys)
-                            elif isinstance(_merged[_key], dict) and isinstance(_value, dict):
-                                _merged[_key] = self._merge_json([_merged[_key], _value], _file_name)
-                            else:
-                                _merged[_key] = _value
-                    else:
-                        # Enhanced merging for entity files and other common conflict files
-                        if _key not in _merged:
-                            _merged[_key] = _value
-                        else:
-                            # Special handling for entity file properties that should be merged
-                            if _file_name.endswith('.json') and _key in ['components', 'component_groups', 'events', 'spawn_rules', 'behaviors']:
-                                # These properties should be merged, not overwritten
-                                if isinstance(_merged[_key], dict) and isinstance(_value, dict):
-                                    # Merge components/component_groups/events dictionaries
-                                    _merged[_key] = self._merge_json([_merged[_key], _value], _file_name)
-                                elif isinstance(_merged[_key], list) and isinstance(_value, list):
-                                    # Merge spawn_rules/behaviors lists
-                                    merged_list = _merged[_key] + _value
-                                    _merged[_key] = remove_duplicates_from_list(merged_list, check_keys=True)
-                                else:
-                                    # Fallback: try to merge if types match
-                                    if type(_merged[_key]) == type(_value):
-                                        if isinstance(_value, dict):
-                                            _merged[_key] = self._merge_json([_merged[_key], _value], _file_name)
-                                        elif isinstance(_value, list):
-                                            merged_list = _merged[_key] + _value
-                                            _merged[_key] = remove_duplicates_from_list(merged_list, check_keys=True)
-                                        else:
-                                            _merged[_key] = _value
-                                    else:
-                                        _merged[_key] = _value
-                            elif isinstance(_merged[_key], list) and isinstance(_value, list):
-                                # Merge lists by combining and removing duplicates
-                                merged_list = _merged[_key] + _value
-                                _merged[_key] = remove_duplicates_from_list(merged_list, check_keys=True)
-                            elif isinstance(_merged[_key], dict) and isinstance(_value, dict):
-                                # Recursively merge dictionaries
-                                _merged[_key] = self._merge_json([_merged[_key], _value], _file_name)
-                            else:
-                                # For primitive values, keep the last one (but log if different)
-                                if str(_merged[_key]) != str(_value) and _key not in ['format_version', 'description']:
-                                    # Only overwrite if values are actually different
-                                    _merged[_key] = _value
-            except Exception as e:
-                print(f"Error processing JSON data for file '{_file_name}': {e}")
-
+        for _json in _json_list:
+            _merged = deep_merge_json(_merged, _json)
         return _merged
     
-    def _merge_player_json(self, _player_json_list):
-        _merged = {}
-        for _json_data in _player_json_list:
-            _merged = self._merge_dicts(_merged, _json_data)
-        return _merged
 
     def _merge_dicts(self, _dict1, _dict2):
         for _key, _value in _dict2.items():
@@ -4616,106 +4118,11 @@ class _App1:
         return '\n'.join([f"{_key}={_value}" for _key, _value in _merged_lang.items()])
 
     def _load_json_with_comments(self, _file):
-        """Load JSON file with robust comment and error handling. Uses same logic as _get_manifest_data."""
+        """Load JSON file with robust comment and error handling."""
         try:
-            # Read the file content - try UTF-8 first, fallback to latin-1
-            try:
-                _file_content = _file.read().decode('utf-8')
-            except UnicodeDecodeError:
-                _file_content = _file.read().decode('latin-1', errors='ignore')
-            
-            # Try json5 first (handles comments natively)
-            json5_available = True
-            try:
-                import json5 as _json5
-            except ImportError:
-                json5_available = False
-                _logging.warning("json5 library not installed, attempting manual comment removal.")
-            
-            if json5_available:
-                try:
-                    return _json5.loads(_file_content)
-                except Exception as json5_error:
-                    # json5 failed, try with cleaned content
-                    _logging.warning(f"json5 parsing failed for {_file.name}, attempting cleanup: {json5_error}")
-                    # Fall through to manual comment removal
-            
-            # Fallback: try to remove comments manually
-            # Remove block comments /* ... */ (non-greedy)
-            _file_content_clean = _re.sub(r'/\*.*?\*/', '', _file_content, flags=_re.DOTALL)
-            
-            # Remove line comments // ... (but not in strings)
-            lines = _file_content_clean.split('\n')
-            cleaned_lines = []
-            for line in lines:
-                # Find // that's not inside a string
-                in_string = False
-                escape_next = False
-                new_line = []
-                i = 0
-                while i < len(line):
-                    char = line[i]
-                    if escape_next:
-                        new_line.append(char)
-                        escape_next = False
-                    elif char == '\\' and in_string:
-                        new_line.append(char)
-                        escape_next = True
-                    elif char == '"' and not escape_next:
-                        in_string = not in_string
-                        new_line.append(char)
-                    elif char == '/' and i + 1 < len(line) and line[i+1] == '/' and not in_string:
-                        # Found // comment outside string
-                        break
-                    else:
-                        new_line.append(char)
-                    i += 1
-                cleaned_lines.append(''.join(new_line))
-            _file_content_clean = '\n'.join(cleaned_lines)
-            
-            # Remove trailing commas before closing braces/brackets
-            _file_content_clean = _re.sub(r',\s*([}\]])', r'\1', _file_content_clean)
-            
-            # Try parsing with standard json
-            try:
-                return _json.loads(_file_content_clean)
-            except Exception as json_error:
-                _logging.warning(f"Error parsing JSON (after cleanup) in file: {_file.name}: {json_error}")
-                _logging.info(f"Attempting JSON extraction for {_file.name}...")
-                # Last resort: try to extract just the JSON structure
-                try:
-                    # Find first { and matching closing }
-                    start_idx = _file_content_clean.find('{')
-                    if start_idx >= 0:
-                        # Count braces to find the matching closing brace
-                        brace_count = 0
-                        in_string = False
-                        escape_next = False
-                        i = start_idx
-                        while i < len(_file_content_clean):
-                            char = _file_content_clean[i]
-                            if escape_next:
-                                escape_next = False
-                            elif char == '\\' and in_string:
-                                escape_next = True
-                            elif char == '"' and not escape_next:
-                                in_string = not in_string
-                            elif not in_string:
-                                if char == '{':
-                                    brace_count += 1
-                                elif char == '}':
-                                    brace_count -= 1
-                                    if brace_count == 0:
-                                        # Found matching closing brace
-                                        json_str = _file_content_clean[start_idx:i+1]
-                                        return _json.loads(json_str)
-                            i += 1
-                except Exception as extract_error:
-                    _logging.error(f"Failed to extract JSON from {_file.name}: {extract_error}")
-            
-            return None
+            return load_json_data(_file.read())
         except Exception as e:
-            _logging.error(f"Error reading or parsing JSON file: {_file.name}: {e}")
+            _logging.error(f"Error reading JSON file: {e}")
             return None
 
     def _get_manifest_data(self, _file):
@@ -4742,116 +4149,7 @@ class _App1:
                 
                 if manifest_path:
                     with _pack_zip.open(manifest_path) as _manifest_file:
-                        try:
-                            # Read the manifest file content - try UTF-8 first, fallback to latin-1
-                            try:
-                                _manifest_content = _manifest_file.read().decode('utf-8')
-                            except UnicodeDecodeError:
-                                _manifest_content = _manifest_file.read().decode('latin-1', errors='ignore')
-                            
-                            # Use json5 library which natively supports comments
-                            # No need to manually remove comments - json5 handles them
-                            # Try json5 first (handles comments natively)
-                            json5_available = True
-                            try:
-                                import json5 as _json5
-                            except ImportError:
-                                json5_available = False
-                                _logging.warning("json5 library not installed, attempting manual comment removal.")
-                            
-                            if json5_available:
-                                try:
-                                    _manifest_data = _json5.loads(_manifest_content)
-                                    return _manifest_data
-                                except Exception as json5_error:
-                                    # json5 failed, try with cleaned content
-                                    _logging.warning(f"json5 parsing failed for {_file}, attempting cleanup: {json5_error}")
-                                    # Fall through to manual comment removal
-                            
-                            # Fallback: try to remove comments manually
-                            # Remove block comments /* ... */ (non-greedy)
-                            _manifest_content_clean = _re.sub(r'/\*.*?\*/', '', _manifest_content, flags=_re.DOTALL)
-                            
-                            # Remove line comments // ... (but not in strings)
-                            lines = _manifest_content_clean.split('\n')
-                            cleaned_lines = []
-                            for line in lines:
-                                # Find // that's not inside a string
-                                in_string = False
-                                escape_next = False
-                                new_line = []
-                                i = 0
-                                while i < len(line):
-                                    char = line[i]
-                                    if escape_next:
-                                        new_line.append(char)
-                                        escape_next = False
-                                    elif char == '\\' and in_string:
-                                        new_line.append(char)
-                                        escape_next = True
-                                    elif char == '"' and not escape_next:
-                                        in_string = not in_string
-                                        new_line.append(char)
-                                    elif char == '/' and i + 1 < len(line) and line[i+1] == '/' and not in_string:
-                                        # Found // comment outside string
-                                        break
-                                    else:
-                                        new_line.append(char)
-                                    i += 1
-                                cleaned_lines.append(''.join(new_line))
-                            _manifest_content_clean = '\n'.join(cleaned_lines)
-                            
-                            # Remove trailing commas before closing braces/brackets
-                            _manifest_content_clean = _re.sub(r',\s*([}\]])', r'\1', _manifest_content_clean)
-                            
-                            # Try parsing with standard json
-                            try:
-                                _manifest_data = _json.loads(_manifest_content_clean)
-                                return _manifest_data
-                            except Exception as json_error:
-                                _logging.warning(f"Error parsing manifest.json (after cleanup) in file: {_file}: {json_error}")
-                                _logging.info(f"Attempting JSON extraction for {_file}...")
-                                # Last resort: try to extract just the JSON structure
-                                try:
-                                    # Find first { and matching closing }
-                                    start_idx = _manifest_content_clean.find('{')
-                                    if start_idx >= 0:
-                                        # Count braces to find the matching closing brace
-                                        brace_count = 0
-                                        end_idx = start_idx
-                                        in_string = False
-                                        escape_next = False
-                                        
-                                        for i in range(start_idx, len(_manifest_content_clean)):
-                                            char = _manifest_content_clean[i]
-                                            if escape_next:
-                                                escape_next = False
-                                            elif char == '\\' and in_string:
-                                                escape_next = True
-                                            elif char == '"' and not escape_next:
-                                                in_string = not in_string
-                                            elif not in_string:
-                                                if char == '{':
-                                                    brace_count += 1
-                                                elif char == '}':
-                                                    brace_count -= 1
-                                                    if brace_count == 0:
-                                                        end_idx = i
-                                                        break
-                                        
-                                        if end_idx > start_idx and brace_count == 0:
-                                            extracted_json = _manifest_content_clean[start_idx:end_idx+1]
-                                            _manifest_data = _json.loads(extracted_json)
-                                            _logging.info(f"Successfully extracted and parsed JSON for {_file}")
-                                            return _manifest_data
-                                        else:
-                                            _logging.error(f"Could not find matching braces for {_file} (start: {start_idx}, end: {end_idx}, brace_count: {brace_count})")
-                                except Exception as extract_error:
-                                    _logging.error(f"JSON extraction failed for {_file}: {extract_error}")
-                                return None
-                        except Exception as e:
-                            _logging.error(f"Error reading manifest.json in file: {_file}: {e}")
-                            return None
+                        return load_json_data(_manifest_file.read())
                 else:
                     _logging.warning(f"manifest.json not found in file: {_file}")
                     return None
@@ -5187,13 +4485,8 @@ class _App1:
             try:
                 with _zipfile.ZipFile(_mcpack_file, 'r') as _zip_ref:
                     try:
-                        _texture_data = _zip_ref.read('textures/flipbook_textures.json').decode('latin-1')
-                        _texture_data_lines = _texture_data.splitlines()
-                        _filtered_texture_data = '\n'.join([_line for _line in _texture_data_lines if not _line.strip().startswith('//')])
-                        _textures_json = _json.loads(_filtered_texture_data)
-                        _merged_textures.extend(_textures_json)
-                    except KeyError:
-                        pass
+                        _merged_textures.extend(load_json_data(_zip_ref.read('textures/flipbook_textures.json')) or [])
+                    except KeyError: pass
             except Exception as _e:
                 _logging.error(f"An error occurred while merging flipbook textures: {_e}", exc_info=True)
 
@@ -5213,13 +4506,8 @@ class _App1:
             try:
                 with _zipfile.ZipFile(_mcpack_file, 'r') as _zip_ref:
                     try:
-                        _texture_data = _zip_ref.read('textures/textures_list.json').decode('latin-1')
-                        _texture_data_lines = _texture_data.splitlines()
-                        _filtered_texture_data = '\n'.join([_line for _line in _texture_data_lines if not _line.strip().startswith('//')])
-                        _textures_json = _json.loads(_filtered_texture_data)
-                        _merged_textures.extend(_textures_json)
-                    except KeyError:
-                        pass
+                        _merged_textures.extend(load_json_data(_zip_ref.read('textures/textures_list.json')) or [])
+                    except KeyError: pass
             except Exception as _e:
                 _logging.error(f"An error occurred while merging textures list: {_e}", exc_info=True)
 
@@ -5308,53 +4596,6 @@ class _App1:
         except Exception as _e:
             pass
             
-    def _show_help(self):
-        _help_window = _tk.Toplevel(self._root)
-        _help_window.title("Help")
-        _help_window.geometry("800x800")
-        _help_window.configure(bg='#0A0A0A')
-
-        _help_text = """
-        How To Use AutoBE
-        
-        Test Addons Individually:
-        Test each addon individually in Minecraft before merging to check compatibility and functionality.
-        
-        Add Files:
-        Click 'Add Files' to select .mcpack files you want to merge.
-        Use Ctrl (or Cmd on Mac) to select multiple files.
-        
-        Check Packs:
-        Click 'Check Packs' to see which Minecraft version each addon belongs to.
-        Organize addons by version into separate folders (e.g., 1.16, 1.21, etc.).
-        
-        Merge by Version:
-        Only merge addons from the same version (e.g., merge all 1.16 addons together).
-        Do not merge addons from different versions (e.g., 1.16 with 1.21).
-        
-        Handling Single Addons:
-        If an addon is the only one for its version, or if it breaks merged packs, handle it alone. 
-        Add it without merging to resolve conflicts.
-        
-        Start Process:
-        Click 'Browse' to select the output directory.
-        Click 'Start Process' to merge selected packs.
-        
-        Testing and Troubleshooting:
-        Test merged packs in Minecraft.
-        If issues occur, remove problematic addons and add them separately.
-        Re-merge compatible addons as needed.
-        
-        Important Notes:
-        Always test addons before and after merging.
-        Ensure you have rights to use or distribute the addons.
-        
-        CodeNex is not responsible for misuse of this tool.
-        Property of CodeNex
-        """
-
-        _help_label = _tk.Label(_help_window, text=_help_text, bg='#0A0A0A', fg='#E1E1E1', font=("Helvetica", 12))
-        _help_label.pack(padx=10, pady=10)
 
     def mcpacker_process_files(self, input_files, output_dir):
         import shutil
