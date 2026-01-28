@@ -1418,17 +1418,21 @@ class _App1:
             else:
                 _messagebox.showerror("Error", error_msg)
     
-    def _add_btn(self, parent, text, command, bg='#9333ea', fg='#FFFFFF', font=("Segoe UI", 11, "bold"), **kwargs):
-        btn = _tk.Button(parent, text=text, command=command, bg=bg, fg=fg, font=font, relief='flat', cursor='hand2', activebackground='#a855f7', **kwargs)
-        return btn
+    def _add_btn(self, parent, text, command, **kwargs):
+        kwargs.setdefault('bg', '#9333ea'); kwargs.setdefault('fg', '#FFFFFF')
+        kwargs.setdefault('font', ("Segoe UI", 11, "bold")); kwargs.setdefault('relief', 'flat')
+        kwargs.setdefault('cursor', 'hand2'); kwargs.setdefault('activebackground', '#a855f7')
+        return _tk.Button(parent, text=text, command=command, **kwargs)
 
-    def _add_lbl_frame(self, parent, text, font=("Segoe UI", 13, "bold"), bg='#1a1a1a', fg='#FFFFFF', **kwargs):
-        frame = _tk.LabelFrame(parent, text=text, font=font, bg=bg, fg=fg, **kwargs)
-        return frame
+    def _add_lbl_frame(self, parent, text, **kwargs):
+        kwargs.setdefault('font', ("Segoe UI", 13, "bold"))
+        kwargs.setdefault('bg', '#1a1a1a'); kwargs.setdefault('fg', '#FFFFFF')
+        return _tk.LabelFrame(parent, text=text, **kwargs)
 
-    def _add_lbl(self, parent, text, bg='#1a1a1a', fg='#FFFFFF', font=("Segoe UI", 10), **kwargs):
-        lbl = _tk.Label(parent, text=text, bg=bg, fg=fg, font=font, **kwargs)
-        return lbl
+    def _add_lbl(self, parent, text, **kwargs):
+        kwargs.setdefault('bg', '#1a1a1a'); kwargs.setdefault('fg', '#FFFFFF')
+        kwargs.setdefault('font', ("Segoe UI", 10))
+        return _tk.Label(parent, text=text, **kwargs)
 
     def _unlock_application(self):
         """Hide activation overlay and show the main application."""
