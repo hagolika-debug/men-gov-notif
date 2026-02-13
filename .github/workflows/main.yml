@@ -1,0 +1,55 @@
+name: Agent Zero Test
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test-agent-zero:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check Docker Version
+        run: docker --version
+
+      - name: Pull Agent Zero Image
+        run: docker pull agent0ai/agent-zero
+
+      - name: Run Agent Zero Container
+        # Running in detached mode (-d) mapping host port 8080 to container port 80
+        run: |
+          docker run -d -p 8080:80 --name agent-zero agent0ai/agent-zero
+          echo "Waiting for container to initialize..."
+          sleep 10
+
+      - name: Verificaion - Check Container Status
+        run: docker ps -a
+
+      - name: Setup Cloudflare Tunnel
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Start Tunnel & Keep Alive
+        run: |
+          # Start the tunnel in the background
+          cloudflared tunnel --url http://localhost:8080 > tunnel.log 2>&1 &
+          PID=$!
+          
+          echo "Waiting for tunnel to establish..."
+          sleep 10
+          
+          echo "========================================================"
+          echo "ACCESS YOUR AGENT ZERO INSTANCE HERE:"
+          grep -o 'https://.*\.trycloudflare\.com' tunnel.log | head -n 1
+          echo "========================================================"
+          
+          # Keep alive for 10 minutes (600 seconds)
+          echo "Workflow will remain active for 10 minutes..."
+          sleep 600
+
+      - name: Debug - Show Container Logs
+        if: always()
+        run: docker logs agent-zero
